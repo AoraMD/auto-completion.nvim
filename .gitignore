@@ -1,0 +1,8 @@
+*
+!lsp-server/
+!lsp-server/deepseek-fim-server
+!lua/
+!lua/auto-completion/
+!lua/auto-completion/init.lua
+!README.md
+!.gitignore

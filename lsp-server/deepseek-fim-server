@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+
+"""Minimal LSP server that translates textDocument/inlineCompletion requests
+into Deepseek FIM Beta API calls.
+
+Communicates over stdin/stdout via JSON-RPC 2.0 framed with the LSP base
+protocol (Content-Length header).  Requires the DEEPSEEK_API_KEY environment
+variable to be set.
+
+Usage:
+    DEEPSEEK_API_KEY=sk-... deepseek-fim-server
+"""
+
+from __future__ import (
+    annotations,
+)
+
+import json
+import os
+import sys
+import urllib.request
+from typing import (
+    TYPE_CHECKING,
+    Any,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import (
+        Mapping,
+    )
+
+
+def _read_message() -> dict[str, Any] | None:
+    headers: dict[str, str] = {}
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return None
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if line == "":
+            break
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
+    content_length = int(headers.get("content-length", "0"))
+    if content_length == 0:
+        return None
+
+    body = sys.stdin.buffer.read(content_length).decode("utf-8")
+    return json.loads(body)
+
+
+def _write_message(
+    msg: Mapping[str, Any],
+) -> None:
+    body = json.dumps(msg, ensure_ascii=False)
+    header = f"Content-Length: {len(body)}\r\n\r\n"
+    sys.stdout.buffer.write(header.encode("utf-8"))
+    sys.stdout.buffer.write(body.encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+def _log(
+    msg: str,
+) -> None:
+    print(f"[auto-completion] {msg}", file=sys.stderr, flush=True)
+
+
+_documents: dict[str, str] = {}
+
+_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+
+_ENDPOINT = "https://api.deepseek.com/beta/completions"
+_MODEL = "deepseek-v4-pro"
+_MAX_TOKENS = 256
+_PREFIX_MAX_CHARS = 4096
+_SUFFIX_MAX_CHARS = 2048
+
+
+def _extract_fim(
+    uri: str,
+    line: int,
+    character: int,
+) -> tuple[str, str]:
+    text = _documents.get(uri, "")
+    if not text:
+        return "", ""
+
+    doc_lines = text.split("\n")
+
+    prefix_parts = doc_lines[:line]
+    if line < len(doc_lines):
+        prefix_parts.append(doc_lines[line][:character])
+    prefix = "\n".join(prefix_parts)
+    if len(prefix) > _PREFIX_MAX_CHARS:
+        prefix = prefix[-_PREFIX_MAX_CHARS:]
+
+    suffix_parts: list[str] = []
+    if line < len(doc_lines):
+        suffix_parts.append(doc_lines[line][character:])
+        suffix_parts.extend(doc_lines[line + 1 :])
+    suffix = "\n".join(suffix_parts)
+    if len(suffix) > _SUFFIX_MAX_CHARS:
+        suffix = suffix[:_SUFFIX_MAX_CHARS]
+
+    return prefix, suffix
+
+
+def _fetch_completion(
+    prefix: str,
+    suffix: str,
+) -> str | None:
+    if not _API_KEY:
+        _log("DEEPSEEK_API_KEY is not set")
+        return None
+
+    body = json.dumps(
+        {
+            "model": _MODEL,
+            "prompt": prefix,
+            "suffix": suffix,
+            "max_tokens": _MAX_TOKENS,
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "stop": ["\n\n\n"],
+        },
+    ).encode("utf-8")
+
+    req = urllib.request.Request(  # noqa: S310
+        _ENDPOINT,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_API_KEY}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8"))
+            choices = data.get("choices", [])
+            if choices and choices[0].get("text"):
+                return choices[0]["text"].rstrip()
+    except OSError as error:
+        _log(f"API request failed: {error}")
+    except json.JSONDecodeError as error:
+        _log(f"API response parse error: {error}")
+
+    return None
+
+
+def _handle_did_open(
+    params: Mapping[str, Any],
+) -> None:
+    _documents[params["textDocument"]["uri"]] = params["textDocument"]["text"]
+
+
+def _handle_did_change(
+    params: Mapping[str, Any],
+) -> None:
+    changes = params.get("contentChanges", [])
+    if changes:
+        _documents[params["textDocument"]["uri"]] = changes[0]["text"]
+
+
+def _handle_did_close(
+    params: Mapping[str, Any],
+) -> None:
+    _documents.pop(params["textDocument"]["uri"], None)
+
+
+def _handle_initialize() -> dict[str, Any]:
+    return {
+        "capabilities": {
+            "textDocumentSync": 1,  # Full
+            "inlineCompletionProvider": {},
+        },
+        "serverInfo": {
+            "name": "auto-completion",
+            "version": "0.1.0",
+        },
+    }
+
+
+def _handle_inline_completion(
+    params: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    uri = params["textDocument"]["uri"]
+    pos = params["position"]
+    line = pos["line"]
+    character = pos["character"]
+
+    prefix, suffix = _extract_fim(uri, line, character)
+    text = _fetch_completion(prefix, suffix)
+    if text is None:
+        return None
+
+    return {"items": [{"insertText": text}]}
+
+
+def main() -> None:
+    _log("auto-completion LSP server started")
+
+    while True:
+        msg = _read_message()
+        if msg is None:
+            break
+
+        method = msg.get("method")
+        msg_id = msg.get("id")
+        params = msg.get("params", {})
+
+        try:
+            if method == "initialize":
+                result = _handle_initialize()
+                _write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": result,
+                    },
+                )
+
+            elif method == "initialized":
+                pass
+
+            elif method == "textDocument/didOpen":
+                _handle_did_open(params)
+
+            elif method == "textDocument/didChange":
+                _handle_did_change(params)
+
+            elif method == "textDocument/didClose":
+                _handle_did_close(params)
+
+            elif method == "textDocument/inlineCompletion":
+                result = _handle_inline_completion(params)
+                _write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": result,
+                    },
+                )
+
+            elif method == "shutdown":
+                _write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": None,
+                    },
+                )
+
+            elif method == "exit":
+                break
+
+            elif msg_id is not None:
+                _write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {
+                            "code": -32601,
+                            "message": f"Method not found: {method}",
+                        },
+                    },
+                )
+
+        except BaseException as exc:  # noqa: BLE001
+            _log(f"Error handling {method}: {exc}")
+            if msg_id is not None:
+                _write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {
+                            "code": -32603,
+                            "message": str(exc),
+                        },
+                    },
+                )
+
+
+if __name__ == "__main__":
+    main()
