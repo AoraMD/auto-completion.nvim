@@ -37,6 +37,8 @@ require("auto-completion").setup(
     },
     -- override the server command (auto-resolved by default)
     -- server_cmd = { "python3", "/custom/path/to/deepseek-fim-server" },
+    -- wait for typing to pause before calling the FIM API
+    -- debounce_ms = 250,
   }
 )
 ```
@@ -75,8 +77,8 @@ continue typing or leave insert mode.
 ```
 Insert mode keystroke
   -> Neovim sends textDocument/inlineCompletion (LSP, stdio)
-  -> deepseek-fim-server extracts prefix/suffix near cursor
+  -> deepseek-fim-server debounces and extracts prefix/suffix near cursor
   -> POST https://api.deepseek.com/beta/completions (FIM)
-  -> returns InlineCompletionItem
+  -> returns InlineCompletionItem only if the request is still current
   -> vim.lsp.inline_completion renders ghost text
 ```

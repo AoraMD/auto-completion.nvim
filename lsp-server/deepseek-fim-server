@@ -18,6 +18,7 @@ from __future__ import (
 import json
 import os
 import sys
+import threading
 import urllib.request
 from typing import (
     TYPE_CHECKING,
@@ -55,10 +56,12 @@ def _write_message(
     msg: Mapping[str, Any],
 ) -> None:
     body = json.dumps(msg, ensure_ascii=False)
-    header = f"Content-Length: {len(body)}\r\n\r\n"
-    sys.stdout.buffer.write(header.encode("utf-8"))
-    sys.stdout.buffer.write(body.encode("utf-8"))
-    sys.stdout.buffer.flush()
+    body_bytes = body.encode("utf-8")
+    header = f"Content-Length: {len(body_bytes)}\r\n\r\n"
+    with _write_lock:
+        sys.stdout.buffer.write(header.encode("utf-8"))
+        sys.stdout.buffer.write(body_bytes)
+        sys.stdout.buffer.flush()
 
 
 def _log(
@@ -67,7 +70,64 @@ def _log(
     print(f"[auto-completion] {msg}", file=sys.stderr, flush=True)
 
 
+def _read_int_env(
+    name: str,
+    default: int,
+) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+
+    try:
+        return int(value)
+    except ValueError:
+        _log(f"Ignoring invalid {name}: {value}")
+        return default
+
+
+def _send_response(
+    msg_id: Any,
+    result: Any,
+) -> None:
+    if msg_id is None:
+        return
+
+    _write_message(
+        {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": result,
+        },
+    )
+
+
+def _send_error(
+    msg_id: Any,
+    code: int,
+    message: str,
+) -> None:
+    if msg_id is None:
+        return
+
+    _write_message(
+        {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        },
+    )
+
+
 _documents: dict[str, str] = {}
+_document_versions: dict[str, int] = {}
+_state_lock = threading.Lock()
+_write_lock = threading.Lock()
+_pending_inline_completion: dict[str, Any] | None = None
+_canceled_request_ids: set[Any] = set()
+_completion_token = 0
 
 _API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
@@ -76,14 +136,34 @@ _MODEL = "deepseek-v4-pro"
 _MAX_TOKENS = 256
 _PREFIX_MAX_CHARS = 4096
 _SUFFIX_MAX_CHARS = 2048
+_DEBOUNCE_MS = max(0, _read_int_env("AUTO_COMPLETION_DEBOUNCE_MS", 250))
+_REQUEST_CANCELLED = -32800
+
+
+def _cancel_pending_inline_completion_locked() -> Any | None:
+    global _pending_inline_completion
+
+    pending = _pending_inline_completion
+    if pending is None:
+        return None
+
+    pending["timer"].cancel()
+    _pending_inline_completion = None
+    return pending["id"]
+
+
+def _invalidate_inline_completions_locked() -> Any | None:
+    global _completion_token
+
+    _completion_token += 1
+    return _cancel_pending_inline_completion_locked()
 
 
 def _extract_fim(
-    uri: str,
+    text: str,
     line: int,
     character: int,
 ) -> tuple[str, str]:
-    text = _documents.get(uri, "")
     if not text:
         return "", ""
 
@@ -154,7 +234,13 @@ def _fetch_completion(
 def _handle_did_open(
     params: Mapping[str, Any],
 ) -> None:
-    _documents[params["textDocument"]["uri"]] = params["textDocument"]["text"]
+    uri = params["textDocument"]["uri"]
+    with _state_lock:
+        _documents[uri] = params["textDocument"]["text"]
+        _document_versions[uri] = _document_versions.get(uri, 0) + 1
+        pending_id = _invalidate_inline_completions_locked()
+
+    _send_response(pending_id, None)
 
 
 def _handle_did_change(
@@ -162,13 +248,25 @@ def _handle_did_change(
 ) -> None:
     changes = params.get("contentChanges", [])
     if changes:
-        _documents[params["textDocument"]["uri"]] = changes[0]["text"]
+        uri = params["textDocument"]["uri"]
+        with _state_lock:
+            _documents[uri] = changes[0]["text"]
+            _document_versions[uri] = _document_versions.get(uri, 0) + 1
+            pending_id = _invalidate_inline_completions_locked()
+
+        _send_response(pending_id, None)
 
 
 def _handle_did_close(
     params: Mapping[str, Any],
 ) -> None:
-    _documents.pop(params["textDocument"]["uri"], None)
+    uri = params["textDocument"]["uri"]
+    with _state_lock:
+        _documents.pop(uri, None)
+        _document_versions.pop(uri, None)
+        pending_id = _invalidate_inline_completions_locked()
+
+    _send_response(pending_id, None)
 
 
 def _handle_initialize() -> dict[str, Any]:
@@ -185,19 +283,109 @@ def _handle_initialize() -> dict[str, Any]:
 
 
 def _handle_inline_completion(
+    msg_id: Any,
     params: Mapping[str, Any],
-) -> dict[str, Any] | None:
+) -> None:
     uri = params["textDocument"]["uri"]
     pos = params["position"]
     line = pos["line"]
     character = pos["character"]
 
-    prefix, suffix = _extract_fim(uri, line, character)
-    text = _fetch_completion(prefix, suffix)
-    if text is None:
-        return None
+    global _completion_token
+    global _pending_inline_completion
 
-    return {"items": [{"insertText": text}]}
+    with _state_lock:
+        stale_pending_id = _cancel_pending_inline_completion_locked()
+        _completion_token += 1
+        token = _completion_token
+
+        text = _documents.get(uri, "")
+        document_version = _document_versions.get(uri, 0)
+        prefix, suffix = _extract_fim(text, line, character)
+
+        if not prefix and not suffix:
+            _pending_inline_completion = None
+            current_id = msg_id
+        else:
+            timer = threading.Timer(
+                _DEBOUNCE_MS / 1000,
+                _run_inline_completion,
+                args=(msg_id, token, uri, document_version, prefix, suffix),
+            )
+            timer.daemon = True
+            _pending_inline_completion = {
+                "id": msg_id,
+                "timer": timer,
+                "token": token,
+            }
+            current_id = None
+            timer.start()
+
+    _send_response(stale_pending_id, None)
+    _send_response(current_id, None)
+
+
+def _run_inline_completion(
+    msg_id: Any,
+    token: int,
+    uri: str,
+    document_version: int,
+    prefix: str,
+    suffix: str,
+) -> None:
+    global _pending_inline_completion
+
+    with _state_lock:
+        pending = _pending_inline_completion
+        if pending is not None and pending["token"] == token:
+            _pending_inline_completion = None
+
+    text = _fetch_completion(prefix, suffix)
+
+    with _state_lock:
+        canceled = msg_id in _canceled_request_ids
+        if canceled:
+            _canceled_request_ids.discard(msg_id)
+
+        stale = (
+            token != _completion_token
+            or _document_versions.get(uri) != document_version
+        )
+
+    if canceled:
+        _send_error(msg_id, _REQUEST_CANCELLED, "Request cancelled")
+        return
+
+    if stale or text is None:
+        _send_response(msg_id, None)
+        return
+
+    _send_response(msg_id, {"items": [{"insertText": text}]})
+
+
+def _handle_cancel_request(
+    params: Mapping[str, Any],
+) -> None:
+    global _completion_token
+    global _pending_inline_completion
+
+    cancel_id = params.get("id")
+    if cancel_id is None:
+        return
+
+    canceled_pending = False
+    with _state_lock:
+        _canceled_request_ids.add(cancel_id)
+        pending = _pending_inline_completion
+        if pending is not None and pending["id"] == cancel_id:
+            pending["timer"].cancel()
+            _pending_inline_completion = None
+            _canceled_request_ids.discard(cancel_id)
+            _completion_token += 1
+            canceled_pending = True
+
+    if canceled_pending:
+        _send_error(cancel_id, _REQUEST_CANCELLED, "Request cancelled")
 
 
 def main() -> None:
@@ -215,16 +403,13 @@ def main() -> None:
         try:
             if method == "initialize":
                 result = _handle_initialize()
-                _write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "result": result,
-                    },
-                )
+                _send_response(msg_id, result)
 
             elif method == "initialized":
                 pass
+
+            elif method == "$/cancelRequest":
+                _handle_cancel_request(params)
 
             elif method == "textDocument/didOpen":
                 _handle_did_open(params)
@@ -236,52 +421,21 @@ def main() -> None:
                 _handle_did_close(params)
 
             elif method == "textDocument/inlineCompletion":
-                result = _handle_inline_completion(params)
-                _write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "result": result,
-                    },
-                )
+                _handle_inline_completion(msg_id, params)
 
             elif method == "shutdown":
-                _write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "result": None,
-                    },
-                )
+                _send_response(msg_id, None)
 
             elif method == "exit":
                 break
 
             elif msg_id is not None:
-                _write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {
-                            "code": -32601,
-                            "message": f"Method not found: {method}",
-                        },
-                    },
-                )
+                _send_error(msg_id, -32601, f"Method not found: {method}")
 
         except BaseException as exc:  # noqa: BLE001
             _log(f"Error handling {method}: {exc}")
             if msg_id is not None:
-                _write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {
-                            "code": -32603,
-                            "message": str(exc),
-                        },
-                    },
-                )
+                _send_error(msg_id, -32603, str(exc))
 
 
 if __name__ == "__main__":

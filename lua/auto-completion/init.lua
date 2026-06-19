@@ -22,7 +22,7 @@ local _DEFAULT_FILETYPES = {
 ---vim.lsp.inline_completion is automatically enabled so that ghost-text
 ---suggestions appear as you type in insert mode.
 ---
----@param opts? {filetypes?: string[], server_cmd?: string[]}
+---@param opts? {filetypes?: string[], server_cmd?: string[], debounce_ms?: integer}
 function M.setup(
   opts
 )
@@ -50,6 +50,9 @@ function M.setup(
 
   vim.lsp.config("auto-completion", {
     cmd = server_cmd,
+    cmd_env = {
+      AUTO_COMPLETION_DEBOUNCE_MS = tostring(opts.debounce_ms or 250),
+    },
     filetypes = opts.filetypes or _DEFAULT_FILETYPES,
   })
 
